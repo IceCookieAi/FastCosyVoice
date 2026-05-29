@@ -1,0 +1,15 @@
+# Build context exclusions — модель и output держим вне образа (mount volumes).
+pretrained_models/
+output/
+.git/
+.github/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+debug/
+examples/
+tmp/
+docker-compose.5090.override.yml

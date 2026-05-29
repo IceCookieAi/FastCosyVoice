@@ -1,0 +1,108 @@
+# =============================================================================
+# Standalone compose для FastCosyVoice — для быстрых локальных тестов из этой
+# папки, без поднятия всего Mika-стека. Образ тот же `fastcosyvoice:5090`,
+# что и в Aiceon/docker-compose.yml (сервис `cosy`), кэш слоёв общий.
+#
+# Основной путь — через главный compose:
+#   cd ..   # Aiceon/
+#   docker compose up cosy -d --build
+#   docker compose logs -f cosy
+#
+# Этот файл нужен только для отдельной разработки/отладки или запуска CLI
+# скриптов (run_fast.py / webui.py) без основного стека.
+#
+# Профили:
+#   default                          → mika_server.py на 8870 (как в main)
+#   --profile bench up bench         → run_fast.py (3 фразы, метрики)
+#   --profile ui up webui            → gradio webui на 7860
+# =============================================================================
+
+services:
+  cosy:
+    build:
+      context: .
+      dockerfile: Dockerfile.5090
+    image: fastcosyvoice:5090
+    container_name: fastcosyvoice-5090
+
+    ports:
+      - "8870:8870"
+
+    environment:
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      CUDA_VISIBLE_DEVICES: "0"
+      HOST: "0.0.0.0"
+      PORT: "8870"
+      LOG_LEVEL: "INFO"
+      COSYVOICE_MODEL_DIR: "pretrained_models/Fun-CosyVoice3-0.5B"
+      # В отдельном режиме refs/ нет — это директория из TTS.Core. Без неё
+      # mika_server.py будет здоров, но эндпоинт TTS будет 404 на любой
+      # reference_id. Для CLI-режима используем --profile bench (run_fast.py).
+      COSYVOICE_REFERENCES_DIR: "/workspace/references"
+      VOICE_REFERENCE_NAME: "mita"
+      COSYVOICE_LLM_MODEL_NAME: "llm.pt"
+      COSYVOICE_LOAD_TRT: "true"
+      COSYVOICE_LOAD_TRT_LLM: "true"
+      COSYVOICE_TRT_LLM_DTYPE: "bfloat16"
+      COSYVOICE_TRT_LLM_KV_CACHE_TOKENS: "8192"
+
+    volumes:
+      - ./pretrained_models:/workspace/FastCosyVoice/pretrained_models
+      - ./output:/workspace/FastCosyVoice/output
+      - ./hf_cache:/root/.cache/huggingface
+      - ./hf_cache/modelscope:/root/.cache/modelscope
+      # Если рядом есть references/ (например, симлинк на TTS.Core/references)
+      # — смонтируется автоматически. Опционально.
+      # - ./references:/workspace/references:ro
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    shm_size: "2g"
+    ipc: host
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8870/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20m
+
+  # CLI-бенчмарк (3 русские фразы, замер TTFB/RTF). НЕ запускает HTTP сервер.
+  # Использование: `docker compose -f docker-compose.5090.yml --profile bench up bench`
+  bench:
+    extends:
+      service: cosy
+    container_name: fastcosyvoice-bench
+    command: ["python", "run_fast.py"]
+    ports: []  # CLI, не сервер
+    # run_fast.py ищет refs/019.wav — алиасим audio.wav оттуда.
+    volumes:
+      - ./pretrained_models:/workspace/FastCosyVoice/pretrained_models
+      - ./output:/workspace/FastCosyVoice/output
+      - ./hf_cache:/root/.cache/huggingface
+      - ./hf_cache/modelscope:/root/.cache/modelscope
+      - ./refs/audio.wav:/workspace/FastCosyVoice/refs/019.wav:ro
+      - ./refs/audio.txt:/workspace/FastCosyVoice/refs/019.txt:ro
+    healthcheck:
+      disable: true
+    tty: true
+    stdin_open: true
+    profiles: ["bench"]
+
+  # Gradio webui для интерактивного теста.
+  webui:
+    extends:
+      service: cosy
+    container_name: fastcosyvoice-webui
+    command: ["python", "webui.py", "--port", "7860", "--model_dir", "pretrained_models/Fun-CosyVoice3-0.5B"]
+    ports:
+      - "7860:7860"
+    healthcheck:
+      disable: true
+    profiles: ["ui"]

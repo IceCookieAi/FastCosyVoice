@@ -1,0 +1,95 @@
+# =============================================================================
+# FastCosyVoice fork — Dockerfile для RTX 5090 (Blackwell sm_120).
+#
+# Отличия от upstream docker/Dockerfile:
+#   - База CUDA 12.8 вместо 12.4 — sm_120 (Blackwell) требует CUDA 12.8+
+#     для нативной компиляции TRT-LLM. На 12.4 TRT-LLM падает или работает
+#     через JIT с большим оверхедом.
+#   - Установка через `uv sync` вместо `conda + pip`. uv.lock в репе уже
+#     содержит правильные индексы (torch→cu128, tensorrt-llm→nvidia), pip
+#     с requirements.txt (плоский snapshot) этого не знает и потянет torch
+#     с cu126, что для sm_120 даёт только PTX JIT (медленнее).
+#   - libpython3.10.so.1.0 экспортирован в LD_LIBRARY_PATH — tensorrt-llm
+#     1.0.0 при инициализации ModelRunnerCpp dlopen'ит libpython без
+#     SONAME-fallback. Без этой переменной падает на _load_trt_llm.
+#
+# Сборка:    docker compose -f docker-compose.5090.yml build
+# Запуск:    docker compose -f docker-compose.5090.yml up
+# =============================================================================
+
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+
+# --- Системные пакеты ------------------------------------------------------
+# python3.10 — единственная версия, которую поддерживает tensorrt-llm 1.0.0.
+# libpython3.10-dev — даёт libpython3.10.so.1.0 для tensorrt-llm dlopen.
+# libopenmpi-dev / openmpi-bin — runtime для tensorrt-llm (MPI rank 0).
+# sox / ffmpeg / libsndfile — audio IO для librosa/soundfile/torchaudio.
+# (pynini НЕ нужен — wetext==0.1.2 в этом lock'е зависит только от
+# contractions+kaldifst, без OpenFst).
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget git git-lfs \
+        build-essential pkg-config \
+        python3.10 python3.10-dev python3.10-distutils python3-pip \
+        libopenmpi-dev openmpi-bin \
+        libsox-dev sox \
+        ffmpeg \
+        libsndfile1 \
+        && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    git lfs install && \
+    ln -sf /usr/bin/python3.10 /usr/local/bin/python && \
+    ln -sf /usr/bin/python3.10 /usr/local/bin/python3
+
+# uv — быстрый pip-replacement, нативно понимает pyproject.toml + uv.lock
+# и [[tool.uv.index]] секции, в т.ч. отдельный индекс для torch/tensorrt-llm.
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# libpython для tensorrt-llm dlopen (см. шапку файла).
+ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+
+# venv в /opt/venv — выносим из /workspace, чтобы bind-mount исходников
+# не затирал установленные пакеты при разработке.
+ENV PATH=/opt/venv/bin:${PATH}
+
+WORKDIR /workspace/FastCosyVoice
+
+# --- Установка зависимостей через uv sync ----------------------------------
+# Сначала только манифесты — слой переиспользуется когда меняются исходники,
+# а deps те же.
+COPY pyproject.toml uv.lock /workspace/FastCosyVoice/
+
+# --no-install-project — не пытаемся установить fastcosyvoice пакетом
+#   (исходники ещё не скопированы; запускаем из /workspace через PYTHONPATH).
+# --frozen — фейлит если lock не сходится с pyproject (catch миграции на
+#   build-этапе, а не на runtime).
+# --python=/usr/bin/python3.10 — uv возьмёт системный python вместо
+#   скачивания своего.
+RUN uv sync --frozen --no-install-project --python=/usr/bin/python3.10
+
+# Sanity-check: wetext должен импортиться (это была главная подозрительная
+# зависимость без wheel'а; в lock'е она 0.1.2 на contractions+kaldifst, без
+# OpenFst — должно работать).
+RUN /opt/venv/bin/python -c "import wetext; print('wetext OK:', wetext.__file__)"
+
+# --- Исходники -------------------------------------------------------------
+# Весь репо. .dockerignore исключает pretrained_models/, output/, .git/.
+COPY . /workspace/FastCosyVoice/
+
+# run_fast.py делает sys.path.append('third_party/Matcha-TTS') — пустой
+# каталог создаём чтобы append не молчком молчал; сам matcha-tts пакет
+# уже стоит из PyPI (matcha-tts==0.0.7.2).
+RUN mkdir -p third_party/Matcha-TTS
+
+# Mika.TTS.Core HTTP API — JSON POST /v1/tts/zero-shot, raw PCM stream.
+EXPOSE 8870
+CMD ["python", "mika_server.py"]
