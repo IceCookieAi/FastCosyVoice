@@ -100,10 +100,15 @@ class FastCosyVoice3:
         top_p: float = 0.95,
         top_k: int = 25,
         speed: float = 1.0,
+        frequency_penalty: float = 0.3,
+        no_repeat_ngram_size: int = 0,
+        safe_pad_id: bool = True,
+        min_tokens_ratio: float = 1.0,
+        disable_text_split: bool = True,
     ):
         """
         Initialize FastCosyVoice3 with parallel pipeline.
-        
+
         Args:
             model_dir: Path to model directory or ModelScope model ID
             fp16: Whether to use FP16 precision (recommended for speed)
@@ -119,6 +124,26 @@ class FastCosyVoice3:
             top_p: Nucleus sampling threshold (0.0-1.0, lower=fewer candidates)
             top_k: Top-K sampling limit (number of top candidates to consider)
             speed: Speech speed multiplier (1.0=normal, <1.0=slower, >1.0=faster)
+            frequency_penalty: Accumulating penalty on repeated tokens in TRT-LLM
+                               sampling. Mimics RAS (Repetition Aware Sampling) from
+                               PyTorch path. 0.0 = disabled (baseline), 0.3 = default.
+            no_repeat_ngram_size: Blocks n-gram repetitions in TRT-LLM. 0 = default
+                                  (disabled). Was set to 2 in original silence-fix
+                                  but found to CAUSE speaker mode-switch defects on
+                                  long pause-heavy texts. Silence-fix stays solid
+                                  via freq_pen, safe_pad_id, min_tokens_ratio.
+            safe_pad_id: If True, use sos_token_id as pad_id (separate from end_id).
+                         If False, use end_id as pad_id (legacy / TRT-LLM issue #280).
+            min_tokens_ratio: Multiplier for text_token_count to compute min_tokens
+                              in TRT-LLM. 2.0 = legacy, 1.0 = default (Russian-friendly,
+                              less pressure to over-generate past natural EOS).
+            disable_text_split: If True (default), skip Cosy's internal sentence-
+                                splitting and treat tts_text as a single chunk.
+                                Designed for callers that already pre-split (e.g.
+                                Mika.TTS.Core via RealtimeTTS). Saves 30-50ms per
+                                redundant split and removes prosody jumps at chunk
+                                boundaries. Set False to restore upstream behavior
+                                (split by . ? ! ; … and synthesize per-sentence).
         """
         self.model_dir = model_dir
         self.fp16 = fp16
@@ -127,6 +152,11 @@ class FastCosyVoice3:
         self.top_p = top_p
         self.top_k = top_k
         self.speed = speed
+        self.frequency_penalty = frequency_penalty
+        self.no_repeat_ngram_size = no_repeat_ngram_size
+        self.safe_pad_id = safe_pad_id
+        self.min_tokens_ratio = min_tokens_ratio
+        self.disable_text_split = disable_text_split
         
         # Download model if not exists
         if not os.path.exists(model_dir):
@@ -426,6 +456,17 @@ class FastCosyVoice3:
         # Initialize TRT-LLM runner
         runtime_rank = tensorrt_llm.mpi_rank()
         
+        # Register RAS logits processor (VALL-E 2 / CosyVoice PyTorch RAS port).
+        # Activated per-request via gen_kwargs['logits_processor_names']=['ras'].
+        # Mitigates "speaker mode-switch" defect that the TRT-LLM path is prone
+        # to (no native RAS). See fastcosyvoice/ras_processor.py.
+        from .ras_processor import RASLogitsProcessor
+        self._ras_processor = RASLogitsProcessor(
+            speech_token_offset=self.speech_token_offset,
+            speech_token_size=self.speech_token_size,
+            win_size=10, max_count=1,
+        )
+
         runner_kwargs = dict(
             engine_dir=trt_engines_dir,
             rank=runtime_rank,
@@ -436,8 +477,9 @@ class FastCosyVoice3:
             max_tokens_in_paged_kv_cache=kv_cache_tokens,
             cuda_graph_mode=False,
             gather_generation_logits=False,
+            logits_processor_map={'ras': self._ras_processor},
         )
-        
+
         self.trt_llm_runner = ModelRunnerCpp.from_dir(**runner_kwargs)
         self.trt_llm_loaded = True
         
@@ -740,6 +782,14 @@ class FastCosyVoice3:
         temperature: float = 0.8,
         top_p: float = 0.95,
         top_k: int = 25,
+        frequency_penalty: float | None = None,
+        no_repeat_ngram_size: int | None = None,
+        safe_pad_id: bool | None = None,
+        min_tokens_ratio: float | None = None,
+        random_seed: int | None = None,
+        bad_speech_ids: list[int] | None = None,
+        repetition_penalty: float | None = None,
+        use_ras: bool = False,
     ) -> Generator[int, None, None]:
         """
         Run LLM inference using TRT-LLM with TRUE STREAMING.
@@ -778,62 +828,102 @@ class FastCosyVoice3:
         max_speech_tokens = int(estimated_duration_sec * 25 * 1.5)  # 1.5x margin
         max_new_tokens = min(max_speech_tokens + 100, 2048)  # Cap at 2048
         
-        # Estimate min tokens to prevent premature EOS.
-        # Token-based: text_tokens * 2 (matches PyTorch min_token_text_ratio=2)
-        # TODO: add character-based estimate for Russian (Qwen2 BPE compresses
-        # Cyrillic heavily, ~2.7 chars/token, so text_tokens*2 covers only ~40%
-        # of actual speech tokens needed). Needs quality measurement first.
-        # min_by_chars = int(len(text) * 1.7)
+        # Resolve silence-fix params from instance defaults if not overridden.
+        # See __init__ docstring for rationale.
+        freq_pen = self.frequency_penalty if frequency_penalty is None else frequency_penalty
+        nr_ngram = self.no_repeat_ngram_size if no_repeat_ngram_size is None else no_repeat_ngram_size
+        use_safe_pad = self.safe_pad_id if safe_pad_id is None else safe_pad_id
+        min_ratio = self.min_tokens_ratio if min_tokens_ratio is None else min_tokens_ratio
+
+        # min_tokens prevents premature EOS. Default ratio=1.0 (Russian-friendly,
+        # since Qwen2 BPE compresses Cyrillic to ~2.7 chars/token; text_tokens*2
+        # over-constrains EOS for short inputs, increasing silent-attractor risk).
+        # Legacy ratio=2.0 matches PyTorch min_token_text_ratio.
         text_token_ids = self.trt_llm_tokenizer.encode(text)
-        min_by_tokens = len(text_token_ids) * 2
-        min_new_tokens = min_by_tokens
-        
+        min_new_tokens = int(len(text_token_ids) * min_ratio)
+
+        # pad_id != end_id when safe_pad_id=True. Mitigates TRT-LLM issue #280
+        # (pad==end can cause "infinite EOS" / silence loops).
+        pad_id_val = self.sos_token_id if use_safe_pad else self.eos1_token_id
+
         logging.debug(
             f'TRT-LLM: text_len={len(text)}, text_tokens={len(text_token_ids)}, '
-            f'min_new_tokens={min_new_tokens} (tok={min_by_tokens}), '
-            f'max_new_tokens={max_new_tokens}'
+            f'min_new_tokens={min_new_tokens} (ratio={min_ratio}), '
+            f'max_new_tokens={max_new_tokens}, freq_pen={freq_pen}, '
+            f'no_repeat_ngram={nr_ngram}, pad_id={pad_id_val} (safe={use_safe_pad})'
         )
-        
+
         # Generate with STREAMING
         llm_gen_start = time.time()
         prev_output_len = 0
         total_raw_tokens = 0
         total_speech_tokens = 0
-        
+
+        # Build kwargs lazily — older TRT-LLM versions may not accept the new
+        # silence-fix kwargs. Omit zero-valued knobs so behavior matches legacy
+        # exactly when silence_fix is disabled per-request.
+        gen_kwargs = dict(
+            batch_input_ids=batch_input_ids,
+            max_new_tokens=max_new_tokens,
+            end_id=self.eos1_token_id,
+            pad_id=pad_id_val,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty if repetition_penalty is not None else 1.1,
+            min_tokens=min_new_tokens,
+            num_return_sequences=1,
+            streaming=True,
+            output_sequence_lengths=True,
+            output_generation_logits=False,
+            return_dict=True,
+            return_all_generated_tokens=True,
+        )
+        if freq_pen and freq_pen > 0:
+            gen_kwargs['frequency_penalty'] = freq_pen
+        if nr_ngram and nr_ngram > 0:
+            gen_kwargs['no_repeat_ngram_size'] = nr_ngram
+        if random_seed is not None:
+            gen_kwargs['random_seed'] = int(random_seed)
+            logging.info(f'TRT-LLM: using pinned random_seed={random_seed}')
+        if use_ras:
+            gen_kwargs['logits_processor_names'] = ['ras']
+            # Reset trigger counter for telemetry per request
+            prev_triggers = self._ras_processor.trigger_total
+            logging.info(f'TRT-LLM: RAS enabled (cumulative triggers before: {prev_triggers})')
+        if bad_speech_ids:
+            # Convert speech IDs → TRT-LLM token IDs by adding speech_token_offset
+            # Format: [[[tok1], [tok2], ...]] — 3 levels (batch, words, tokens-per-word)
+            bad_token_ids = [self.speech_token_offset + int(sid) for sid in bad_speech_ids]
+            gen_kwargs['bad_words_list'] = [[[tid] for tid in bad_token_ids]]  # type: ignore[assignment]
+            logging.info(f'TRT-LLM: blocking speech_ids={bad_speech_ids} → token_ids={bad_token_ids}')
+
+        # When random_seed pinned (investigation mode), capture full token sequence
+        # for offline analysis. Output goes to /workspace/FastCosyVoice/output/tokens/
+        # (host: Mika.TTS.CosyVoice/output/tokens/) which is volume-mounted.
+        all_raw_tokens: list[int] = [] if random_seed is not None else None  # type: ignore
+
         try:
             with torch.inference_mode():
                 # streaming=True returns an iterator that yields incremental outputs
-                outputs_iter = self.trt_llm_runner.generate(
-                    batch_input_ids=batch_input_ids,
-                    max_new_tokens=max_new_tokens,
-                    end_id=self.eos1_token_id,
-                    pad_id=self.eos1_token_id,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    repetition_penalty=1.1,
-                    min_tokens=min_new_tokens,
-                    num_return_sequences=1,
-                    streaming=True,  # TRUE STREAMING!
-                    output_sequence_lengths=True,
-                    output_generation_logits=False,
-                    return_dict=True,
-                    return_all_generated_tokens=True  # Get all tokens each iteration
-                )
-                
+                outputs_iter = self.trt_llm_runner.generate(**gen_kwargs)
+
                 # Iterate over streaming outputs
                 for outputs in outputs_iter:
                     output_ids = outputs["output_ids"]
                     sequence_lengths = outputs["sequence_lengths"]
-                    
+
                     output_end = sequence_lengths[0][0].item()
                     current_generated = output_ids[0][0][input_length:output_end].tolist()
-                    
+
                     # Extract only NEW tokens since last iteration
                     new_tokens = current_generated[prev_output_len:]
                     prev_output_len = len(current_generated)
                     total_raw_tokens += len(new_tokens)
-                    
+
+                    if all_raw_tokens is not None:
+                        all_raw_tokens.extend(new_tokens)
+
                     # Extract and yield speech tokens immediately
                     for tid in new_tokens:
                         if self.speech_token_offset <= tid < self.speech_token_offset + self.speech_token_size:
@@ -843,6 +933,34 @@ class FastCosyVoice3:
         finally:
             # Cleanup batch input tensors
             del batch_input_ids
+            if all_raw_tokens is not None:
+                try:
+                    import json
+                    tok_dir = '/workspace/FastCosyVoice/output/tokens'
+                    os.makedirs(tok_dir, exist_ok=True)
+                    out_path = f'{tok_dir}/seed{random_seed:04d}.json'
+                    with open(out_path, 'w', encoding='utf-8') as f:
+                        json.dump({
+                            'seed': random_seed,
+                            'text': text,
+                            'text_tokens': len(text_token_ids),
+                            'input_tokens': input_length,
+                            'total_raw_tokens': len(all_raw_tokens),
+                            'speech_token_offset': self.speech_token_offset,
+                            'speech_token_size': self.speech_token_size,
+                            'eos1_token_id': self.eos1_token_id,
+                            'sos_token_id': self.sos_token_id,
+                            'raw_tokens': all_raw_tokens,
+                            'speech_tokens': [t - self.speech_token_offset for t in all_raw_tokens
+                                              if self.speech_token_offset <= t < self.speech_token_offset + self.speech_token_size],
+                            'sampling_params': {
+                                'temperature': temperature, 'top_p': top_p, 'top_k': top_k,
+                                'freq_pen': freq_pen, 'no_repeat_ngram': nr_ngram,
+                                'min_tokens': min_new_tokens, 'pad_id': pad_id_val,
+                            },
+                        }, f, ensure_ascii=False)
+                except Exception as exc:
+                    logging.warning(f'Failed to dump tokens: {exc}')
         
         llm_gen_elapsed = time.time() - llm_gen_start
         raw_tps = total_raw_tokens / llm_gen_elapsed if llm_gen_elapsed > 0 else 0
@@ -864,6 +982,14 @@ class FastCosyVoice3:
         temperature: float = 0.8,
         top_p: float = 0.95,
         top_k: int = 25,
+        frequency_penalty: float | None = None,
+        no_repeat_ngram_size: int | None = None,
+        safe_pad_id: bool | None = None,
+        min_tokens_ratio: float | None = None,
+        random_seed: int | None = None,
+        bad_speech_ids: list[int] | None = None,
+        repetition_penalty: float | None = None,
+        use_ras: bool = False,
     ):
         """
         TRT-LLM token generation job - runs in dedicated thread.
@@ -871,7 +997,7 @@ class FastCosyVoice3:
         """
         llm_start_time = time.time()
         token_count = 0
-        
+
         try:
             for speech_token in self._run_trt_llm_inference_streaming(
                 text=text,
@@ -881,6 +1007,14 @@ class FastCosyVoice3:
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                safe_pad_id=safe_pad_id,
+                min_tokens_ratio=min_tokens_ratio,
+                random_seed=random_seed,
+                bad_speech_ids=bad_speech_ids,
+                repetition_penalty=repetition_penalty,
+                use_ras=use_ras,
             ):
                 with tokens_lock:
                     tokens_list.append(speech_token)
@@ -972,6 +1106,15 @@ class FastCosyVoice3:
         temperature: float | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        frequency_penalty: float | None = None,
+        no_repeat_ngram_size: int | None = None,
+        safe_pad_id: bool | None = None,
+        min_tokens_ratio: float | None = None,
+        disable_text_split: bool | None = None,
+        random_seed: int | None = None,
+        bad_speech_ids: list[int] | None = None,
+        repetition_penalty: float | None = None,
+        use_ras: bool = False,
     ) -> Generator[bytes, None, None]:
         """
         Zero-shot streaming TTS inference with parallel pipeline.
@@ -1007,17 +1150,31 @@ class FastCosyVoice3:
         # Process stress marks (auto + manual conversion)
         tts_text = self._process_stress(tts_text, auto_stress)
         #prompt_text = self._process_stress(prompt_text, auto_stress)
-        
+
         # Normalize prompt text
         prompt_text = self.frontend.text_normalize(
             prompt_text, split=False, text_frontend=text_frontend
         )
-        
+
+        # Resolve disable_text_split: instance default unless overridden.
+        no_split = self.disable_text_split if disable_text_split is None else disable_text_split
+
+        # Build text_chunks. When no_split=True the whole input is treated as a
+        # single chunk — assumes caller already pre-split (e.g. RealtimeTTS in
+        # Mika.TTS.Core). Saves 30-50ms per redundant split + removes prosody
+        # discontinuity at chunk boundaries.
+        if no_split:
+            normalized = self.frontend.text_normalize(
+                tts_text, split=False, text_frontend=text_frontend
+            )
+            text_chunks = [normalized] if normalized else []
+        else:
+            text_chunks = list(self.frontend.text_normalize(
+                tts_text, split=True, text_frontend=text_frontend
+            ))
+
         # Process each text chunk
-        for text_chunk in tqdm(
-            self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend),
-            desc='Synthesizing'
-        ):
+        for text_chunk in tqdm(text_chunks, desc='Synthesizing'):
             # Warn if text is too short
             if not hasattr(text_chunk, '__iter__') or isinstance(text_chunk, str):
                 if len(text_chunk) < 0.5 * len(prompt_text):
@@ -1050,11 +1207,21 @@ class FastCosyVoice3:
                     target=self._trt_llm_job,
                     args=(text_chunk, prompt_text, prompt_speech_tokens,
                           tokens_list, llm_end_flag, tokens_lock),
-                    kwargs={'temperature': temperature, 'top_p': top_p, 'top_k': top_k},
+                    kwargs={
+                        'temperature': temperature, 'top_p': top_p, 'top_k': top_k,
+                        'frequency_penalty': frequency_penalty,
+                        'no_repeat_ngram_size': no_repeat_ngram_size,
+                        'safe_pad_id': safe_pad_id,
+                        'min_tokens_ratio': min_tokens_ratio,
+                        'random_seed': random_seed,
+                        'bad_speech_ids': bad_speech_ids,
+                        'repetition_penalty': repetition_penalty,
+                        'use_ras': use_ras,
+                    },
                     daemon=True
                 )
                 llm_thread.start()
-                
+
                 # Use streaming architecture: Flow+Hift runs in thread, consumes tokens as they arrive
                 for model_output in self.model.tts_stream_external_llm(
                     tokens_list=tokens_list,
@@ -1069,11 +1236,13 @@ class FastCosyVoice3:
                     logging.info(f'Yield speech len={speech_len:.3f}s, rtf={rtf:.3f}')
                     yield self._tensor_to_pcm_bytes(audio_tensor)
                     start_time = time.time()
-                
+
                 # Wait for LLM thread to finish
                 llm_thread.join(timeout=5.0)
             else:
-                # Use PyTorch LLM with parallel pipeline
+                # Use PyTorch LLM with parallel pipeline (RAS already in original).
+                # Silence-fix knobs (freq_penalty, no_repeat_ngram, pad_id,
+                # min_tokens_ratio) only apply to TRT-LLM path.
                 for model_output in self.model.tts_stream(
                     **model_input,
                     temperature=temperature, top_p=top_p, top_k=top_k,
@@ -1098,6 +1267,11 @@ class FastCosyVoice3:
         temperature: float | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        frequency_penalty: float | None = None,
+        no_repeat_ngram_size: int | None = None,
+        safe_pad_id: bool | None = None,
+        min_tokens_ratio: float | None = None,
+        disable_text_split: bool | None = None,
     ) -> Generator[bytes, None, None]:
         """
         Cross-lingual streaming TTS inference with parallel pipeline.
@@ -1129,13 +1303,22 @@ class FastCosyVoice3:
         temperature = temperature if temperature is not None else self.temperature
         top_p = top_p if top_p is not None else self.top_p
         top_k = top_k if top_k is not None else self.top_k
-        
+
         tts_text = self._process_stress(tts_text, auto_stress)
-        
-        for text_chunk in tqdm(
-            self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend),
-            desc='Synthesizing (cross-lingual)'
-        ):
+
+        # Resolve disable_text_split: instance default unless overridden.
+        no_split = self.disable_text_split if disable_text_split is None else disable_text_split
+        if no_split:
+            normalized = self.frontend.text_normalize(
+                tts_text, split=False, text_frontend=text_frontend
+            )
+            text_chunks = [normalized] if normalized else []
+        else:
+            text_chunks = list(self.frontend.text_normalize(
+                tts_text, split=True, text_frontend=text_frontend
+            ))
+
+        for text_chunk in tqdm(text_chunks, desc='Synthesizing (cross-lingual)'):
             model_input = self.frontend.frontend_cross_lingual(
                 text_chunk, prompt_wav, self.sample_rate, zero_shot_spk_id
             )
@@ -1152,7 +1335,13 @@ class FastCosyVoice3:
                     target=self._trt_llm_job,
                     args=(text_chunk, '', [],
                           tokens_list, llm_end_flag, tokens_lock),
-                    kwargs={'temperature': temperature, 'top_p': top_p, 'top_k': top_k},
+                    kwargs={
+                        'temperature': temperature, 'top_p': top_p, 'top_k': top_k,
+                        'frequency_penalty': frequency_penalty,
+                        'no_repeat_ngram_size': no_repeat_ngram_size,
+                        'safe_pad_id': safe_pad_id,
+                        'min_tokens_ratio': min_tokens_ratio,
+                    },
                     daemon=True
                 )
                 llm_thread.start()
