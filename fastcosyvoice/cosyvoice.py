@@ -103,8 +103,9 @@ class FastCosyVoice3:
         frequency_penalty: float = 0.3,
         no_repeat_ngram_size: int = 0,
         safe_pad_id: bool = True,
-        min_tokens_ratio: float = 1.0,
+        min_tokens_ratio: float = 1.5,
         disable_text_split: bool = True,
+        repetition_penalty: float = 1.0,
     ):
         """
         Initialize FastCosyVoice3 with parallel pipeline.
@@ -157,6 +158,7 @@ class FastCosyVoice3:
         self.safe_pad_id = safe_pad_id
         self.min_tokens_ratio = min_tokens_ratio
         self.disable_text_split = disable_text_split
+        self.repetition_penalty = repetition_penalty
         
         # Download model if not exists
         if not os.path.exists(model_dir):
@@ -870,7 +872,10 @@ class FastCosyVoice3:
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-            repetition_penalty=repetition_penalty if repetition_penalty is not None else 1.1,
+            repetition_penalty=(
+                repetition_penalty if repetition_penalty is not None
+                else self.repetition_penalty
+            ),
             min_tokens=min_new_tokens,
             num_return_sequences=1,
             streaming=True,
@@ -1457,7 +1462,7 @@ class FastCosyVoice3:
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
-                    repetition_penalty=1.1,
+                    repetition_penalty=self.repetition_penalty,
                     min_tokens=min_new_tokens,
                     num_return_sequences=1,
                     streaming=False,

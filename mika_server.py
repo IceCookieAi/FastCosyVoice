@@ -102,7 +102,14 @@ FREQ_PENALTY_DEFAULT = float(os.environ.get("COSYVOICE_FREQ_PENALTY", "0.3"))
 # changed 2 → 0.
 NO_REPEAT_NGRAM_DEFAULT = int(os.environ.get("COSYVOICE_NO_REPEAT_NGRAM", "0"))
 SAFE_PAD_ID_DEFAULT = os.environ.get("COSYVOICE_SAFE_PAD_ID", "true").lower() == "true"
-MIN_TOKENS_RATIO_DEFAULT = float(os.environ.get("COSYVOICE_MIN_TOKENS_RATIO", "1.0"))
+MIN_TOKENS_RATIO_DEFAULT = float(os.environ.get("COSYVOICE_MIN_TOKENS_RATIO", "1.5"))
+# repetition_penalty: was hardcoded 1.1 in cosyvoice.py. Accumulates over FULL
+# context. On long texts (250+ chars) it suppresses common speech tokens, making
+# EOS relatively attractive → premature cutoff of last words. Switched default
+# to 1.0 (off) on 2026-05-29. RAS v3 handles repetition защиту через sliding
+# window — глобальный rep_penalty избыточен и контрпродуктивен для TTS длинных
+# фраз. Per-request override via TTSRequest.
+REPETITION_PENALTY_DEFAULT = float(os.environ.get("COSYVOICE_REPETITION_PENALTY", "1.0"))
 # Disable Cosy's internal sentence splitter. Default TRUE because TTS.Core's
 # RealtimeTTS already pre-splits the stream into sentence chunks; running
 # Cosy's split_paragraph on top is redundant (30-50ms × N extra inferences)
@@ -674,6 +681,7 @@ async def health() -> dict:
         "safe_pad_id_default": SAFE_PAD_ID_DEFAULT,
         "min_tokens_ratio_default": MIN_TOKENS_RATIO_DEFAULT,
         "disable_text_split_default": DISABLE_TEXT_SPLIT_DEFAULT,
+        "repetition_penalty_default": REPETITION_PENALTY_DEFAULT,
     }
 
 
@@ -876,6 +884,10 @@ async def tts_zero_shot(req: TTSRequest):
         else DISABLE_TEXT_SPLIT_DEFAULT
     )
     use_ras = req.use_ras if req.use_ras is not None else USE_RAS_DEFAULT
+    rep_pen = (
+        req.repetition_penalty if req.repetition_penalty is not None
+        else REPETITION_PENALTY_DEFAULT
+    )
 
     instr_log = (
         (req.instruction[:40] + "…")
@@ -884,7 +896,7 @@ async def tts_zero_shot(req: TTSRequest):
     )
     seed_log = req.random_seed if req.random_seed is not None else "<auto>"
     logger.info(
-        "TTS [%s] T=%.2f P=%.2f K=%d fp=%.2f nrg=%d spad=%s mtr=%.2f nosplit=%s ras=%s seed=%s instr=%r text=%r",
+        "TTS [%s] T=%.2f P=%.2f K=%d fp=%.2f nrg=%d spad=%s mtr=%.2f nosplit=%s ras=%s rp=%.2f seed=%s instr=%r text=%r",
         req.reference_id,
         req.temperature,
         req.top_p,
@@ -895,6 +907,7 @@ async def tts_zero_shot(req: TTSRequest):
         min_ratio,
         no_split,
         use_ras,
+        rep_pen,
         seed_log,
         instr_log,
         req.text[:80],
@@ -923,7 +936,7 @@ async def tts_zero_shot(req: TTSRequest):
             no_split,
             req.random_seed,
             req.bad_speech_ids,
-            req.repetition_penalty,
+            rep_pen,
             use_ras,
         ),
         media_type="audio/L16; rate=24000; channels=1",
