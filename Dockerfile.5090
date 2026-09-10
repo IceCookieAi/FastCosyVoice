@@ -18,6 +18,9 @@
 # Запуск:    docker compose -f docker-compose.5090.yml up
 # =============================================================================
 
+# uv фиксированной версии из официального образа — источник для COPY ниже.
+FROM ghcr.io/astral-sh/uv:0.11.23 AS uv
+
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -53,7 +56,12 @@ RUN apt-get update -y && \
 
 # uv — быстрый pip-replacement, нативно понимает pyproject.toml + uv.lock
 # и [[tool.uv.index]] секции, в т.ч. отдельный индекс для torch/tensorrt-llm.
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+#
+# Берётся из официального образа, а НЕ через `curl https://astral.sh/... | sh`:
+# тот вариант скачивал и исполнял скрипт без верификации и без пина версии —
+# каждая сборка могла получить другой uv. Так же сделано в Mika.Utils.Neuro,
+# Mika.Memory и Mika.Chat.Engine.
+COPY --from=uv /uv /usr/local/bin/uv
 
 # libpython для tensorrt-llm dlopen (см. шапку файла).
 ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
