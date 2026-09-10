@@ -4,11 +4,15 @@ output/
 .git/
 .github/
 .venv/
-__pycache__/
+# С `**/`, а не якорно: правило вида `.mypy_cache/` действует только от корня
+# контекста и не ловит вложенные — cosyvoice/tokenizer, cosyvoice/cli и
+# fastcosyvoice несли 634 МБ кеша прямо в слой `COPY .`.
+**/__pycache__/
 *.pyc
 *.pyo
-.pytest_cache/
-.mypy_cache/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
 debug/
 examples/
 tmp/

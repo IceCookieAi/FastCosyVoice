@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # =============================================================================
 # FastCosyVoice fork — Dockerfile для RTX 5090 (Blackwell sm_120).
 #
@@ -74,7 +75,10 @@ COPY pyproject.toml uv.lock /workspace/FastCosyVoice/
 #   build-этапе, а не на runtime).
 # --python=/usr/bin/python3.10 — uv возьмёт системный python вместо
 #   скачивания своего.
-RUN uv sync --frozen --no-install-project --python=/usr/bin/python3.10
+# Кеш uv на маунте, а не в слое: при UV_LINK_MODE=copy каждое колесо иначе
+# лежит дважды — в /root/.cache/uv и в /opt/venv, это давало +21 ГБ в образе.
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --frozen --no-install-project --python=/usr/bin/python3.10
 
 # Sanity-check: wetext должен импортиться (это была главная подозрительная
 # зависимость без wheel'а; в lock'е она 0.1.2 на contractions+kaldifst, без
