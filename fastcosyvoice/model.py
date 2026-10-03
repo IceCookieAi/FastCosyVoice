@@ -65,6 +65,9 @@ class FastCosyVoice3Model:
         
         # Token hop length must match training static_chunk_size
         self.token_hop_len = 25
+        # Первый чанк короче сетки ради времени до первого звука (как codec_chunk_frames=15
+        # в vllm-omni); второй добирает до сетки static_chunk_size.
+        self.first_hop_len = 15
         
         # LLM gets dedicated CUDA stream for true parallelism
         if torch.cuda.is_available():
@@ -207,6 +210,15 @@ class FastCosyVoice3Model:
             del prompt_speech_token_gpu, prompt_speech_token_len_gpu, embedding_gpu
             llm_end_flag['done'] = True
     
+    def _hop_len(self, token_offset: int, prompt_token_pad: int) -> int:
+        """Сколько новых токенов отдать во Flow следующим чанком."""
+        if token_offset == 0:
+            return self.first_hop_len
+        if token_offset == self.first_hop_len:
+            realign = self.token_hop_len + prompt_token_pad - self.first_hop_len
+            return realign if realign >= self.first_hop_len else realign + self.token_hop_len
+        return self.token_hop_len
+
     def _flow_hift_job(
         self,
         tokens_list: list,
@@ -241,7 +253,7 @@ class FastCosyVoice3Model:
                     time.sleep(0.0005)
                     
                     # Calculate required tokens
-                    this_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
+                    this_hop_len = self._hop_len(token_offset, prompt_token_pad)
                     required_tokens = this_hop_len + self.flow.pre_lookahead_len
                     
                     # Check token availability (thread-safe)
