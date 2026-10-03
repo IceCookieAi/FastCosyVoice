@@ -72,8 +72,12 @@ class FastCosyVoice3Model:
         # LLM gets dedicated CUDA stream for true parallelism
         if torch.cuda.is_available():
             self.llm_stream = torch.cuda.Stream(self.device)
+            # Свой поток для Flow+HiFT: на default stream их ядра встают в очередь за
+            # каждым шагом стриминга TRT-LLM, и первый чанк простаивает.
+            self.flow_stream = torch.cuda.Stream(self.device)
         else:
             self.llm_stream = None
+            self.flow_stream = None
     
     def load(self, llm_model: str, flow_model: str, hift_model: str, *, load_llm: bool = True):
         """Load model weights from files.
@@ -247,7 +251,11 @@ class FastCosyVoice3Model:
         hift_call_count = 0
         
         try:
-            with torch.inference_mode():
+            stream_ctx = nullcontext()
+            if self.flow_stream is not None:
+                self.flow_stream.wait_stream(torch.cuda.default_stream(self.device))
+                stream_ctx = torch.cuda.stream(self.flow_stream)
+            with stream_ctx, torch.inference_mode():
                 while True:
                     # Minimal polling
                     time.sleep(0.0005)
