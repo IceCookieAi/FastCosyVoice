@@ -86,7 +86,7 @@ EMPTY_CACHE_BETWEEN_REQUESTS = (
     os.environ.get("COSYVOICE_EMPTY_CACHE_BETWEEN_REQUESTS", "true").lower() == "true"
 )
 LAZY_SPEAKER_REGISTRATION = (
-    os.environ.get("COSYVOICE_LAZY_SPEAKER_REGISTRATION", "true").lower() == "true"
+    os.environ.get("COSYVOICE_LAZY_SPEAKER_REGISTRATION", "false").lower() == "true"
 )
 
 # Silence-hallucination fix defaults (Layer 1, root-fix via TRT-LLM sampling).
