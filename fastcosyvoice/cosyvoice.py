@@ -1277,6 +1277,10 @@ class FastCosyVoice3:
         safe_pad_id: bool | None = None,
         min_tokens_ratio: float | None = None,
         disable_text_split: bool | None = None,
+        random_seed: int | None = None,
+        bad_speech_ids: list[int] | None = None,
+        repetition_penalty: float | None = None,
+        use_ras: bool = False,
     ) -> Generator[bytes, None, None]:
         """
         Cross-lingual streaming TTS inference with parallel pipeline.
@@ -1346,6 +1350,10 @@ class FastCosyVoice3:
                         'no_repeat_ngram_size': no_repeat_ngram_size,
                         'safe_pad_id': safe_pad_id,
                         'min_tokens_ratio': min_tokens_ratio,
+                        'random_seed': random_seed,
+                        'bad_speech_ids': bad_speech_ids,
+                        'repetition_penalty': repetition_penalty,
+                        'use_ras': use_ras,
                     },
                     daemon=True
                 )

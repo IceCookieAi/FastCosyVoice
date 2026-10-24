@@ -3,7 +3,7 @@
 Контракт (зеркало `Mika.TTS.Core/app/services/tts/cosy_voice_engine.py`):
 
   POST /v1/tts/zero-shot   JSON {text, reference_id="pool/N", streaming,
-                                 temperature, top_p, top_k}
+                                 temperature, top_p, top_k, cross_lingual?}
                            → stream raw PCM int16 LE mono @ 24 kHz, без RIFF.
   GET  /health             → {status, sample_rate, trt_llm_loaded, ...}
   GET  /v1/references      → список доступных pool/N для отладки.
@@ -425,6 +425,13 @@ class TTSRequest(BaseModel):
         "Use for playground experiments — TTS.Core does NOT need "
         "to send this; default behavior is unchanged.",
     )
+    cross_lingual: bool = Field(
+        False,
+        description="Speak with the reference's timbre only: the LLM gets no "
+        "reference text or speech, so a voice recorded in one language "
+        "speaks another without its accent. Re-encodes the reference each "
+        "call; instruction is not used.",
+    )
 
 
 PLAYGROUND_HTML = """<!doctype html>
@@ -786,32 +793,46 @@ def _stream_pcm(
     bad_speech_ids: list[int] | None,
     repetition_penalty: float | None,
     use_ras: bool,
+    cross_lingual: bool,
 ):
     """Generator: yields raw PCM int16 LE mono @ 24 kHz, без RIFF.
 
     Запускается в worker-потоке через StreamingResponse — FastCosyVoice3
     generator блокирующий, нельзя крутить в event loop напрямую.
     """
+    sampling = dict(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        frequency_penalty=frequency_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        safe_pad_id=safe_pad_id,
+        min_tokens_ratio=min_tokens_ratio,
+        disable_text_split=disable_text_split,
+        random_seed=random_seed,
+        bad_speech_ids=bad_speech_ids,
+        repetition_penalty=repetition_penalty,
+        use_ras=use_ras,
+    )
     try:
         with torch.inference_mode():
-            for pcm_bytes in state.cosyvoice.inference_zero_shot_stream(
-                tts_text=text,
-                prompt_text=prompt_text,
-                prompt_wav=str(audio_path),
-                zero_shot_spk_id=spk_id,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                frequency_penalty=frequency_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                safe_pad_id=safe_pad_id,
-                min_tokens_ratio=min_tokens_ratio,
-                disable_text_split=disable_text_split,
-                random_seed=random_seed,
-                bad_speech_ids=bad_speech_ids,
-                repetition_penalty=repetition_penalty,
-                use_ras=use_ras,
-            ):
+            if cross_lingual:
+                # CosyVoice3 expects the system prompt in the text itself when the LLM has no reference prompt.
+                chunks = state.cosyvoice.inference_cross_lingual_stream(
+                    tts_text=f"{INSTRUCTION}<|endofprompt|>{text}",
+                    prompt_wav=str(audio_path),
+                    zero_shot_spk_id=spk_id,
+                    **sampling,
+                )
+            else:
+                chunks = state.cosyvoice.inference_zero_shot_stream(
+                    tts_text=text,
+                    prompt_text=prompt_text,
+                    prompt_wav=str(audio_path),
+                    zero_shot_spk_id=spk_id,
+                    **sampling,
+                )
+            for pcm_bytes in chunks:
                 yield pcm_bytes
     except Exception as exc:  # noqa: BLE001
         # FastAPI StreamingResponse swallow'ит exception без логирования —
@@ -832,7 +853,12 @@ async def tts_zero_shot(req: TTSRequest):
     if state.cosyvoice is None:
         raise HTTPException(503, "model not loaded yet")
 
-    if req.instruction is None:
+    if req.cross_lingual:
+        # The vendored frontend_cross_lingual deletes the LLM prompt from the speaker it is given:
+        # a cached speaker would lose it for every later zero-shot call, so the reference is encoded afresh.
+        audio_path, _, _ = _resolve_reference(req.reference_id)
+        prompt_text, spk_id = "", ""
+    elif req.instruction is None:
         # Default path: cached speaker embedding (fast, ~0ms overhead).
         # TTS.Core uses this path — никакого instruction в request не шлёт.
         audio_path, prompt_text, spk_id = _ensure_speaker_registered(req.reference_id)
@@ -896,8 +922,9 @@ async def tts_zero_shot(req: TTSRequest):
     )
     seed_log = req.random_seed if req.random_seed is not None else "<auto>"
     logger.info(
-        "TTS [%s] T=%.2f P=%.2f K=%d fp=%.2f nrg=%d spad=%s mtr=%.2f nosplit=%s ras=%s rp=%.2f seed=%s instr=%r text=%r",
+        "TTS [%s] cross=%s T=%.2f P=%.2f K=%d fp=%.2f nrg=%d spad=%s mtr=%.2f nosplit=%s ras=%s rp=%.2f seed=%s instr=%r text=%r",
         req.reference_id,
+        req.cross_lingual,
         req.temperature,
         req.top_p,
         req.top_k,
@@ -938,6 +965,7 @@ async def tts_zero_shot(req: TTSRequest):
             req.bad_speech_ids,
             rep_pen,
             use_ras,
+            req.cross_lingual,
         ),
         media_type="audio/L16; rate=24000; channels=1",
         headers=headers,
